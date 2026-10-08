@@ -27,8 +27,16 @@ fn harness() -> Harness<'static, PdfCraftApp> {
 }
 
 fn at(h: &Harness<'static, PdfCraftApp>, x: f32, y: f32) -> Pos2 {
-    let r = h.state().views[0].page_screen_rect(0).expect("on screen");
-    pos2(r.left() + x / 300.0 * r.width(), r.top() + (400.0 - y) / 400.0 * r.height())
+    let s = h.state();
+    let page = &s.session.get(s.views[0].id).unwrap().info.pages[0];
+    let xf = pdfcraft_ui_egui::canvas::PageXform {
+        rect: s.views[0].page_screen_rect(0).expect("on screen"),
+        rot: s.views[0].rotation,
+        pw: page.width,
+        ph: page.height,
+    };
+    let p = page.user_to_view(x, y);
+    xf.norm_to_screen(p[0] / xf.pw, p[1] / xf.ph)
 }
 
 fn click(h: &mut Harness<'static, PdfCraftApp>, x: f32, y: f32) {
@@ -48,12 +56,28 @@ fn items(h: &Harness<'static, PdfCraftApp>) -> Vec<(String, Option<String>)> {
     v
 }
 
+/// Page rasters arrive from the render worker independently of kittest's virtual frames.
+fn rendered_ink(h: &mut Harness<'static, PdfCraftApp>, x: f32, y: f32) -> image::RgbaImage {
+    for _ in 0..50 {
+        h.run_steps(2);
+        let p = at(h, x, y);
+        let pixels = h.render().unwrap();
+        if pixels.get_pixel(p.x as u32, p.y as u32).0[..3].iter().all(|v| *v < 60) {
+            return pixels;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("signature ink did not render at ({x}, {y})");
+}
+
 #[test]
 fn text_marks_and_date() {
     let mut h = harness();
     assert!(h.state_mut().execute("sign.fill.check"));
     assert!(matches!(h.state().quick_tool, QuickTool::Fill(_)));
     click(&mut h, 50.0, 350.0);
+    click(&mut h, 80.0, 350.0);
+    assert_eq!(h.state().quick_tool, QuickTool::Fill(FillTool::Check), "checkmarks stay repeatable");
     h.state_mut().execute("sign.fill.date");
     click(&mut h, 50.0, 300.0);
     h.state_mut().execute("sign.fill.text");
@@ -63,7 +87,7 @@ fn text_marks_and_date() {
     h.key_press(egui::Key::Enter);
     h.run_steps(4);
     let v = items(&h);
-    assert_eq!(v.len(), 3, "{v:?}");
+    assert_eq!(v.len(), 4, "{v:?}");
     assert!(v.iter().any(|(t, c)| t == "FreeText" && c.as_deref() == Some("Ada Lovelace")));
     assert!(v.iter().any(|(t, c)| t == "FreeText" && c.as_deref().is_some_and(|c| c.matches('/').count() == 2)), "a date: {v:?}");
     assert!(v.iter().any(|(t, _)| t == "Stamp"));
@@ -95,6 +119,8 @@ fn signing_draws_a_signature_once_and_places_it() {
     assert_eq!(h.state().dialog, None);
     click(&mut h, 60.0, 100.0);
     assert!(items(&h).iter().any(|(t, _)| t == "Ink"));
+    assert_eq!(h.state().quick_tool, QuickTool::Select);
+    assert_eq!(h.state().views[0].comments.selected, Some((0, 0)));
     // The signature is remembered (persisted with the app's settings).
     let saved = h.state().persist();
     let mut again = PdfCraftApp::new();
@@ -116,6 +142,7 @@ fn typed_signatures_and_initials() {
     assert_eq!(h.state().signature, Some(pdfcraft_ui_egui::fill_sign::SavedSig::Typed("Grace Hopper".into())));
     click(&mut h, 60.0, 100.0);
     assert!(items(&h).iter().any(|(t, _)| t == "Stamp"), "typed signatures are filled outlines");
+    assert_eq!(h.state().quick_tool, QuickTool::Select);
     // Initials: their own pad (GH), then placed.
     assert!(h.state_mut().execute("sign.fill.initials"));
     h.run_steps(2);
@@ -147,6 +174,8 @@ fn changing_saved_signatures_and_initials_preserves_placed_marks() {
     // The quick toolbar exposes replacement without changing the normal placement action.
     h.get_by_label("Fill & Sign").click();
     h.run_steps(2);
+    h.get_by_label("Fill & Sign").click();
+    h.run_steps(2);
     h.get_by_label("Change signature").click();
     h.run_steps(2);
     assert_eq!(h.state().dialog, Some(Dialog::Signature));
@@ -165,6 +194,8 @@ fn changing_saved_signatures_and_initials_preserves_placed_marks() {
     click(&mut h, 40.0, 200.0);
     assert_eq!(items(&h).len(), 2);
 
+    h.get_by_label("Fill & Sign").click();
+    h.run_steps(2);
     h.get_by_label("Fill & Sign").click();
     h.run_steps(2);
     h.get_by_label("Change initials").click();
@@ -280,7 +311,11 @@ fn long_typed_names_fit_the_placed_signature_and_keep_every_outline() {
 fn signature_file(test: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("pdfcraft-signature-{test}-{}.png", std::process::id()));
     let image = image::RgbaImage::from_fn(120, 40, |x, y| {
-        if (10..110).contains(&x) && (15..25).contains(&y) { image::Rgba([20, 30, 40, 255]) } else { image::Rgba([0, 0, 0, 0]) }
+        if (10..110).contains(&x) && (15..25).contains(&y) || (10..20).contains(&x) && (5..15).contains(&y) {
+            image::Rgba([20, 30, 40, 255])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
     });
     image.save(&path).unwrap();
     path
@@ -311,6 +346,8 @@ fn image_signatures_and_initials_can_be_imported_placed_and_remembered() {
         h.get_by_label("Apply").click();
         h.run_steps(3);
         click(&mut h, 40.0, y);
+        assert_eq!(h.state().quick_tool, QuickTool::Select);
+        assert_eq!(h.state().views[0].comments.selected, Some((0, usize::from(initials))));
     }
     assert_eq!(items(&h).len(), 2);
     let state = h.state();
@@ -351,6 +388,125 @@ fn image_signatures_and_initials_can_be_imported_placed_and_remembered() {
     if let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
         h.render().unwrap().save(format!("{dir}/image-signatures.png")).unwrap();
     }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn image_signature_preview_follows_pointer_at_page_size_with_zoom_and_rotation() {
+    let path = signature_file("pointer");
+    let image = pdfcraft_engine::SignatureImage::read(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut h = harness();
+    // A link under the placement point must not replace the image with a hand cursor.
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::AddLink {
+        page: 0,
+        rect: [30.0, 230.0, 60.0, 270.0],
+        action: pdfcraft_engine::LinkAction::Page(0),
+        style: pdfcraft_engine::LinkStyle::default(),
+    });
+    h.state_mut().signature = Some(SavedSig::Image(image));
+    h.state_mut().execute("sign.fill.signature");
+    // Exercise document rotation and view rotation separately and together.
+    let mut previous_document_rotation = 0;
+    for (document_rotation, view_rotation, zoom) in [(0, 0, "150"), (90, 0, "100"), (0, 90, "100"), (90, 90, "75"), (0, 180, "75"), (0, 270, "100")] {
+        let delta = document_rotation - previous_document_rotation;
+        if delta != 0 {
+            assert!(h.state_mut().apply_edit(pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees: delta }));
+        }
+        previous_document_rotation = document_rotation;
+        while h.state().views[0].rotation != view_rotation {
+            h.state_mut().views[0].rotate_view(true);
+        }
+        h.state_mut().set_option("zoom", zoom).unwrap();
+        h.run_steps(3);
+        for y in [250.0, 150.0] {
+            h.hover_at(at(&h, 40.0, y));
+            h.run_steps(2);
+            assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::None, "the image replaces the crosshair");
+            let ink = at(&h, 90.0, y);
+            let margin = at(&h, 42.0, y);
+            let upper_stroke = at(&h, 52.0, y + 8.0);
+            let lower_margin = at(&h, 52.0, y - 8.0);
+            let pixels = h.render().unwrap();
+            assert!(pixels.get_pixel(ink.x as u32, ink.y as u32).0[..3].iter().all(|v| *v < 60), "ink follows the pointer at the placed size");
+            assert!(pixels.get_pixel(margin.x as u32, margin.y as u32).0[..3].iter().all(|v| *v > 240), "alpha exposes the page");
+            assert!(
+                pixels.get_pixel(upper_stroke.x as u32, upper_stroke.y as u32).0[..3].iter().all(|v| *v < 60),
+                "the asymmetric image rotates with the page"
+            );
+            assert!(pixels.get_pixel(lower_margin.x as u32, lower_margin.y as u32).0[..3].iter().all(|v| *v > 240), "the image isn't flipped");
+            if y == 150.0 {
+                let old = at(&h, 90.0, 250.0);
+                assert!(pixels.get_pixel(old.x as u32, old.y as u32).0[..3].iter().all(|v| *v > 240), "moving the pointer removes the old preview");
+            }
+            if document_rotation == 0
+                && view_rotation == 0
+                && y == 250.0
+                && let Ok(dir) = std::env::var("PDFCRAFT_SHOTS")
+            {
+                pixels.save(format!("{dir}/image-signature-pointer.png")).unwrap();
+            }
+        }
+        assert!(items(&h).is_empty(), "hovering never adds a signature");
+        assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().info.links.len(), 1, "the original link remains");
+    }
+    h.hover_at(pos2(5.0, 5.0));
+    h.run_steps(2);
+    assert_ne!(h.output().platform_output.cursor_icon, egui::CursorIcon::None, "restore the pointer off the page");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn image_signature_placement_selects_resize_handles_and_requires_reselecting_to_repeat() {
+    let path = signature_file("resize");
+    let image = pdfcraft_engine::SignatureImage::read(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut h = harness();
+    h.state_mut().signature = Some(SavedSig::Image(image.clone()));
+    h.state_mut().initials = Some(SavedSig::Image(image));
+    h.state_mut().comment_prefs.pinned = true;
+    h.state_mut().execute("sign.fill.signature");
+    click(&mut h, 40.0, 250.0);
+    assert_eq!(h.state().quick_tool, QuickTool::Select, "signatures place once even when comment tools are pinned");
+    assert_eq!(h.state().views[0].comments.selected, Some((0, 0)));
+    let placed = rendered_ink(&mut h, 90.0, 250.0);
+    if let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
+        placed.save(format!("{dir}/image-signature-selected.png")).unwrap();
+    }
+    // The bottom-right handle is ready without another selection click.
+    let corner = at(&h, 136.0, 234.0);
+    h.hover_at(corner);
+    h.run_steps(2);
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeNwSe);
+    h.drag_at(corner);
+    h.run_steps(1);
+    let end = corner + egui::vec2(96.0, 32.0);
+    h.hover_at(end);
+    h.run_steps(2);
+    h.drop_at(end);
+    h.run_steps(3);
+    let doc = h.state().session.get(h.state().views[0].id).unwrap();
+    assert!(doc.info.annotations[0].rect.iter().zip([40.0, 218.0, 184.0, 266.0]).all(|(a, b)| (*a - b).abs() < 0.001));
+    assert_eq!(doc.can_undo(), Some("Resize comment"));
+    rendered_ink(&mut h, 160.0, 242.0);
+    h.state_mut().undo();
+    h.run_steps(2);
+    assert!(
+        h.state().session.get(h.state().views[0].id).unwrap().info.annotations[0]
+            .rect
+            .iter()
+            .zip([40.0, 234.0, 136.0, 266.0])
+            .all(|(a, b)| (*a - b).abs() < 0.001)
+    );
+    h.state_mut().redo();
+    h.run_steps(2);
+    click(&mut h, 40.0, 150.0);
+    assert_eq!(items(&h).len(), 1, "a later page click doesn't add another signature");
+    h.state_mut().execute("sign.fill.signature");
+    click(&mut h, 40.0, 150.0);
+    assert_eq!(items(&h).len(), 2, "selecting the saved signature again places another");
+    h.state_mut().execute("sign.fill.initials");
+    click(&mut h, 40.0, 100.0);
+    assert_eq!(h.state().quick_tool, QuickTool::Select);
+    assert_eq!(h.state().views[0].comments.selected, Some((0, 2)));
     std::fs::remove_file(path).unwrap();
 }
 

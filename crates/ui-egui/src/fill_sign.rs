@@ -353,7 +353,7 @@ pub(crate) fn signature_entries(ui: &mut egui::Ui, app: &mut crate::PdfCraftApp,
     command
 }
 
-/// Clicks with a Fill & Sign tool on one page. Returns `true` when the click was used.
+/// Preview and clicks with a Fill & Sign tool on one page.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn page_input(
     ui: &egui::Ui,
@@ -365,18 +365,48 @@ pub(crate) fn page_input(
     view: &mut DocView,
     signature: Option<&SavedSig>,
     initials: Option<&SavedSig>,
+    preview: &mut Option<(SavedSig, egui::TextureHandle)>,
     author: &str,
     today: (i64, u32, u32),
 ) -> Option<FillAction> {
     let pointer = ui.input(|i| i.pointer.hover_pos())?;
-    if !xf.rect.contains(pointer) {
-        return None;
-    }
-    ui.ctx().set_cursor_icon(if tool == FillTool::Text { egui::CursorIcon::Text } else { egui::CursorIcon::Crosshair });
-    if !resp.clicked() {
+    if !resp.contains_pointer() || !xf.rect.contains(pointer) {
         return None;
     }
     let at = to_user(xf, info, page, pointer);
+    let saved = match tool {
+        FillTool::Signature => signature,
+        FillTool::Initials => initials,
+        _ => None,
+    };
+    if let Some(SavedSig::Image(image)) = saved {
+        if let Some(rect) = image.rect(at, tool == FillTool::Initials) {
+            // Map each corner, rather than the bounding box, so page and view rotations
+            // turn the preview exactly as they turn the placed stamp.
+            let tex = image_texture(ui, image, preview);
+            let mut mesh = egui::Mesh::with_texture(tex);
+            let corners = [(rect[0], rect[3], 0.0, 0.0), (rect[2], rect[3], 1.0, 0.0), (rect[2], rect[1], 1.0, 1.0), (rect[0], rect[1], 0.0, 1.0)];
+            if let Some(p) = info.pages.get(page) {
+                for (x, y, u, v) in corners {
+                    let p = p.user_to_view(x as f32, y as f32);
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: xf.norm_to_screen(p[0] / xf.pw, p[1] / xf.ph),
+                        uv: pos2(u, v),
+                        color: Color32::WHITE,
+                    });
+                }
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                ui.painter().add(egui::Shape::mesh(mesh));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            }
+        }
+    } else {
+        ui.ctx().set_cursor_icon(if tool == FillTool::Text { egui::CursorIcon::Text } else { egui::CursorIcon::Crosshair });
+    }
+    if !resp.clicked() {
+        return None;
+    }
     match tool {
         FillTool::Text => {
             view.fill_text = Some(TypeBox { page, at: [at[0], at[1] + TEXT_SIZE * 0.6], text: String::new(), focus: true });
@@ -387,11 +417,11 @@ pub(crate) fn page_input(
             Some(FillAction::Edit(Box::new(typed(page, [at[0], at[1] + TEXT_SIZE * 0.6], &format!("{m}/{d}/{y}"), author))))
         }
         FillTool::Signature => match signature {
-            Some(s) => place(page, at, s, false, author).map(|e| FillAction::Edit(Box::new(e))),
+            Some(s) => place(page, at, s, false, author).map(|e| FillAction::Signature(Box::new(e))),
             None => Some(FillAction::CreateSignature),
         },
         FillTool::Initials => match initials {
-            Some(s) => place(page, at, s, true, author).map(|e| FillAction::Edit(Box::new(e))),
+            Some(s) => place(page, at, s, true, author).map(|e| FillAction::Signature(Box::new(e))),
             None => Some(FillAction::CreateInitials),
         },
         mark => {
@@ -407,6 +437,8 @@ pub(crate) fn page_input(
 #[derive(Clone, Debug, PartialEq)]
 pub enum FillAction {
     Edit(Box<Edit>),
+    /// Place once, then select the new signature or initials for adjustment.
+    Signature(Box<Edit>),
     /// No signature yet: open the signature pad.
     CreateSignature,
     /// No initials yet.
@@ -545,23 +577,29 @@ pub(crate) fn signature_pad(
     (apply, cancel, false)
 }
 
-fn image_preview(ui: &egui::Ui, rect: egui::Rect, image: &SignatureImage, cache: &mut Option<(SavedSig, egui::TextureHandle)>) {
+fn image_texture(ui: &egui::Ui, image: &SignatureImage, cache: &mut Option<(SavedSig, egui::TextureHandle)>) -> egui::TextureId {
     let key = SavedSig::Image(image.clone());
-    if cache.as_ref().is_none_or(|(s, _)| *s != key) {
+    if cache.as_ref().is_some_and(|(s, _)| *s != key) {
+        *cache = None;
+    }
+    let (_, tex) = cache.get_or_insert_with(|| {
         let pixels = egui::ColorImage::from_rgba_unmultiplied(image.size(), image.rgba());
-        *cache = Some((key, ui.ctx().load_texture("signature-image", pixels, egui::TextureOptions::LINEAR)));
-    }
-    if let Some((_, tex)) = cache {
-        let [w, h] = image.size();
-        let size = vec2(w as f32, h as f32);
-        let size = size * (rect.width() / size.x).min(rect.height() / size.y);
-        ui.painter().image(
-            tex.id(),
-            egui::Rect::from_center_size(rect.center(), size),
-            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-    }
+        (key, ui.ctx().load_texture("signature-image", pixels, egui::TextureOptions::LINEAR))
+    });
+    tex.id()
+}
+
+fn image_preview(ui: &egui::Ui, rect: egui::Rect, image: &SignatureImage, cache: &mut Option<(SavedSig, egui::TextureHandle)>) {
+    let tex = image_texture(ui, image, cache);
+    let [w, h] = image.size();
+    let size = vec2(w as f32, h as f32);
+    let size = size * (rect.width() / size.x).min(rect.height() / size.y);
+    ui.painter().image(
+        tex,
+        egui::Rect::from_center_size(rect.center(), size),
+        egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 fn pad_buttons(ui: &mut egui::Ui, d: &mut SigDraft) -> (bool, bool) {

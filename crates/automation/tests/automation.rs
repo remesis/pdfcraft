@@ -1131,10 +1131,26 @@ fn image_signatures_through_tools_preserve_transparency_and_survive_save() {
     assert_eq!(ok(&mut a, "edit_undo", json!({ "doc": doc }))["undone"], "Add initials");
     assert_eq!(ok(&mut a, "comment_list", json!({ "doc": doc }))["count"], 1);
     ok(&mut a, "edit_redo", json!({ "doc": doc }));
+    // The same resize edit the selection handles use must keep the imported appearance.
+    for rect in [json!([20, 40, 20, 88]), json!([20, 40, 100000000, 88])] {
+        assert!(a.call("comment_edit", &json!({ "doc": doc, "page": 1, "index": 1, "rect": rect })).is_err());
+    }
+    ok(&mut a, "comment_lock", json!({ "doc": doc, "page": 1, "index": 1 }));
+    assert!(a.call("comment_edit", &json!({ "doc": doc, "page": 1, "index": 1, "rect": [20, 40, 164, 88] })).is_err());
+    ok(&mut a, "comment_lock", json!({ "doc": doc, "page": 1, "index": 1, "locked": false }));
+    assert_eq!(render(&mut a, doc), before, "invalid and locked resizes leave the image intact");
+    ok(&mut a, "comment_edit", json!({ "doc": doc, "page": 1, "index": 1, "rect": [20, 40, 164, 88] }));
+    let resized = render(&mut a, doc);
+    assert_eq!(resized.get_pixel(110, 64).0, [0, 0, 0, 255], "resizing scales the original ink");
+    assert_eq!(resized.get_pixel(25, 64).0, [255, 255, 255, 255], "resizing retains alpha");
+    assert_eq!(ok(&mut a, "edit_undo", json!({ "doc": doc }))["undone"], "Resize comment");
+    assert_eq!(render(&mut a, doc), before);
+    ok(&mut a, "edit_redo", json!({ "doc": doc }));
+    assert_eq!(render(&mut a, doc), resized);
     ok(&mut a, "doc_save", json!({ "doc": doc, "path": "signed.pdf" }));
     let reopened = ok(&mut a, "doc_open", json!({ "path": "signed.pdf" }))["doc"].as_u64().unwrap();
     assert_eq!(ok(&mut a, "comment_list", json!({ "doc": reopened }))["count"], 2);
-    assert_eq!(render(&mut a, reopened), before, "saved appearances retain alpha and geometry");
+    assert_eq!(render(&mut a, reopened), resized, "resized appearances retain alpha and geometry after save");
     for args in [
         json!({ "type": "signature", "path": "broken.png" }),
         json!({ "type": "signature", "path": "signature.png", "text": "Ada" }),

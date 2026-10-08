@@ -85,19 +85,24 @@ impl SignatureImage {
     }
 
     /// Left edge at `at`, vertically centered, with the same 150 pt width cap as typed names.
-    pub fn edit(&self, page: usize, at: [f64; 2], initials: bool, author: &str) -> Option<Edit> {
+    pub fn rect(&self, at: [f64; 2], initials: bool) -> Option<[f64; 4]> {
         if !at.iter().all(|v| v.is_finite()) {
             return None;
         }
         let [w, h] = self.size;
         let scale = (150.0 / w as f64).min(if initials { 24.0 } else { 32.0 } / h as f64);
         let (width, height) = (w as f64 * scale, h as f64 * scale);
+        Some([at[0], at[1] - height / 2.0, at[0] + width, at[1] + height / 2.0])
+    }
+
+    pub fn edit(&self, page: usize, at: [f64; 2], initials: bool, author: &str) -> Option<Edit> {
+        let rect = self.rect(at, initials)?;
         let label = if initials { "Add initials" } else { "Add signature" };
         Some(Edit::Batch {
             label: label.into(),
             edits: vec![Edit::AddCustomStamp {
                 page,
-                rect: [at[0], at[1] - height / 2.0, at[0] + width, at[1] + height / 2.0],
+                rect,
                 name: if initials { "Initials" } else { "Signature" }.into(),
                 file: MarkFile { name: "signature.png".into(), bytes: self.bytes.clone(), page: 0 },
                 author: author.into(),
