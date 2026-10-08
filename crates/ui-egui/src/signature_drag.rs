@@ -10,6 +10,7 @@ use crate::comments::{CommentView, Gesture, PageCx};
 #[derive(Default)]
 pub(crate) struct SignatureDrag {
     key: Option<(u64, usize, usize)>,
+    aspect_ratio: Option<f32>,
     layers: Option<Layers>,
 }
 
@@ -29,11 +30,14 @@ impl SignatureDrag {
         let key = selected.map(|(p, i)| (doc.edit_generation(), p, i));
         if self.key != key {
             self.key = key;
+            self.aspect_ratio = None;
             self.layers = None;
             if let Some((_, page, index)) = key
                 && doc.info.annotations.iter().any(|a| a.page == page && a.index == index && a.subtype == "Stamp" && !a.locked)
                 && let Ok(Some(preview)) = doc.image_signature_preview(page, index)
             {
+                let [width, height] = preview.image.size();
+                self.aspect_ratio = Some(width as f32 / height as f32);
                 self.layers = Some(Layers {
                     opacity: preview.opacity,
                     image: ctx.load_texture(
@@ -81,6 +85,11 @@ impl SignatureDrag {
 
     pub fn contains(&self, page: usize, index: usize) -> bool {
         self.key.is_some_and(|(_, p, i)| (p, i) == (page, index)) && self.layers.is_some()
+    }
+
+    /// Use the embedded image's proportions, even after an edge handle stretched its rectangle.
+    pub fn aspect_ratio(&self, page: usize, index: usize) -> Option<f32> {
+        self.key.filter(|(_, p, i)| (*p, *i) == (page, index)).and(self.aspect_ratio)
     }
 
     /// Movement/resizing only change this signature's geometry, so its background is reusable.

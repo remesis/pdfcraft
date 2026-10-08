@@ -335,7 +335,7 @@ pub enum Gesture {
     /// Moving a comment, from the press position on screen.
     Move { page: usize, index: usize, from: Pos2 },
     /// Resizing a comment by one of its handles: (dx, dy) ∈ {-1, 0, 1}² says which sides move.
-    Resize { page: usize, index: usize, handle: (i8, i8), from: Pos2 },
+    Resize { page: usize, index: usize, handle: (i8, i8), from: Pos2, aspect_ratio: Option<f32> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -504,8 +504,8 @@ impl PageCx<'_> {
         }
         match (gesture, pointer) {
             (Some(Gesture::Move { page, index, from }), Some(p)) if (*page, *index) == (self.page, a.index) => r.translate(p - *from),
-            (Some(Gesture::Resize { page, index, handle, from }), Some(p)) if (*page, *index) == (self.page, a.index) => {
-                resized(r, *handle, p - *from)
+            (Some(Gesture::Resize { page, index, handle, from, aspect_ratio }), Some(p)) if (*page, *index) == (self.page, a.index) => {
+                resized(r, *handle, p - *from, *aspect_ratio)
             }
             _ => r,
         }
@@ -538,7 +538,17 @@ fn handle_pos(r: Rect, (hx, hy): (i8, i8)) -> Pos2 {
     pos2(x, y)
 }
 
-fn resized(r: Rect, (hx, hy): (i8, i8), d: egui::Vec2) -> Rect {
+fn resized(r: Rect, (hx, hy): (i8, i8), d: egui::Vec2, aspect_ratio: Option<f32>) -> Rect {
+    if hx != 0
+        && hy != 0
+        && let Some(ratio) = aspect_ratio.filter(|v| v.is_finite() && *v > 0.0)
+    {
+        // As in content_ui, the larger requested dimension drives proportional corner resizing.
+        // Keep the opposite corner fixed and prevent crossing it from flipping the image.
+        let width = (r.width() + f32::from(hx) * d.x).max((r.height() + f32::from(hy) * d.y) * ratio).max(4.0).max(4.0 * ratio);
+        let anchor = handle_pos(r, (-hx, -hy));
+        return Rect::from_two_pos(anchor, anchor + vec2(f32::from(hx) * width, f32::from(hy) * width / ratio));
+    }
     let mut r = r;
     match hx {
         -1 => r.min.x += d.x,
@@ -798,7 +808,12 @@ fn select_input(
         && let Some(o) = origin
     {
         if let (Some(h), Some(a)) = (handle_at(o), selected) {
-            cv.gesture = Some(Gesture::Resize { page: cx.page, index: a.index, handle: h, from: o });
+            let aspect_ratio = view.signature_drag.aspect_ratio(cx.page, a.index).and_then(|ratio| {
+                let p = cx.info.pages.get(cx.page)?;
+                let rotation = u32::from(p.rotation) + u32::from(cx.xf.rot);
+                Some(if rotation % 180 == 0 { ratio } else { ratio.recip() })
+            });
+            cv.gesture = Some(Gesture::Resize { page: cx.page, index: a.index, handle: h, from: o, aspect_ratio });
             consumed = true;
         } else if let Some(a) = cx.hit(o)
             && !is_markup(&a.subtype)
@@ -826,10 +841,10 @@ fn select_input(
                     view.pending_edit = Some(Edit::MoveAnnotation { page, index, dx, dy });
                 }
             }
-            Some(Gesture::Resize { page, index, handle, from }) if page == cx.page => {
+            Some(Gesture::Resize { page, index, handle, from, aspect_ratio }) if page == cx.page => {
                 cv.gesture = None;
                 if let Some(a) = cx.get(index) {
-                    let r = resized(cx.screen_rect(a), handle, p - from);
+                    let r = resized(cx.screen_rect(a), handle, p - from, aspect_ratio);
                     let rect = cx.rect_to_user(r);
                     if r.width() >= 4.0 && r.height() >= 4.0 {
                         view.pending_edit = Some(Edit::ResizeAnnotation { page, index, rect });
@@ -1354,6 +1369,27 @@ pub fn status_badge(state: &str) -> Option<(&'static str, &'static str, Color32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proportional_corners_keep_the_opposite_anchor_and_edges_stretch_one_axis() {
+        let r = Rect::from_min_max(pos2(100.0, 100.0), pos2(196.0, 132.0));
+        for (hx, hy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+            for (dx, dy) in [(24.0, 0.0), (0.0, 16.0), (-48.0, -20.0), (-200.0, -200.0)] {
+                let out = resized(r, (hx, hy), vec2(f32::from(hx) * dx, f32::from(hy) * dy), Some(3.0));
+                assert_eq!(handle_pos(out, (-hx, -hy)), handle_pos(r, (-hx, -hy)));
+                assert!((out.width() / out.height() - 3.0).abs() < 0.001);
+                assert!(out.width() >= 4.0 && out.height() >= 4.0);
+            }
+        }
+        for handle in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+            let out = resized(r, handle, vec2(24.0, 16.0), Some(3.0));
+            assert_eq!(out, resized(r, handle, vec2(24.0, 16.0), None));
+            assert_eq!(if handle.0 == 0 { out.width() } else { out.height() }, if handle.0 == 0 { r.width() } else { r.height() });
+        }
+        // Ordinary comment corners keep their existing independent width/height behavior.
+        let free = resized(r, (1, 1), vec2(24.0, 0.0), None);
+        assert_eq!(free.size(), vec2(120.0, 32.0));
+    }
 
     #[test]
     fn tools_round_trip_through_their_commands() {
