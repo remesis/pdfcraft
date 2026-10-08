@@ -125,6 +125,8 @@ M0 → M1 → M2 → M3 → M4 must happen in order. After M4, M5–M12 can run 
 
 ## Log
 
+- **2026-10-08 (M5.7, image signatures):** Fill & Sign imports local PNG/JPEG signatures and initials through the Image tab, with previews, local persistence and undoable placement. The shared engine validates bounded images and preserves transparency and orientation; `fill_sign_add` accepts an image path. Synthetic UI and automation tests cover cancellation, invalid input, settings, undo/redo and save/reopen rendering. Overall effort estimate unchanged (about 30–35%).
+
 - **2026-10-08 (M9, #179):** Windows Current User Personal certificate store identities join file-based digital IDs, signing through CNG without exporting keys. RSA-2048 and ECDSA P-256 round trips use temporary certificates with cleanup guards; enumeration, missing identities, automation errors and the password-free UI have regression coverage. Smart cards and PKCS #11 remain planned; overall effort estimate unchanged.
 
 Newest first. One line per session: the date, what moved, and the new overall percentage.

@@ -1101,6 +1101,56 @@ fn fill_and_sign_through_tools() {
 }
 
 #[test]
+fn image_signatures_through_tools_preserve_transparency_and_survive_save() {
+    let dir = workdir("image-signatures");
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, 120, 40);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let rgba: Vec<u8> = (0..40)
+            .flat_map(|y| (0..120).flat_map(move |x| if (40..80).contains(&x) && (10..30).contains(&y) { [0, 0, 0, 255] } else { [0, 0, 0, 0] }))
+            .collect();
+        encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
+    }
+    std::fs::write(dir.join("signature.png"), png).unwrap();
+    std::fs::write(dir.join("broken.png"), b"broken").unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_create", json!({ "from": "blank", "width": 200, "height": 300 }))["doc"].as_u64().unwrap();
+    for (kind, y) in [("signature", 60), ("initials", 120)] {
+        ok(&mut a, "fill_sign_add", json!({ "doc": doc, "page": 1, "type": kind, "at": [20, y], "path": "signature.png" }));
+    }
+    let render = |a: &mut Automation, doc| {
+        let output = a.call("page_render", &json!({ "doc": doc, "page": 1, "dpi": 72 })).unwrap();
+        let Content::Png { data, .. } = &output[0] else { panic!() };
+        image::load_from_memory(data).unwrap().to_rgba8()
+    };
+    let before = render(&mut a, doc);
+    assert_eq!(before.get_pixel(25, 60).0, [255, 255, 255, 255], "transparent margin exposes the page");
+    assert_eq!(before.get_pixel(65, 60).0, [0, 0, 0, 255], "signature ink is embedded");
+    assert_eq!(ok(&mut a, "edit_undo", json!({ "doc": doc }))["undone"], "Add initials");
+    assert_eq!(ok(&mut a, "comment_list", json!({ "doc": doc }))["count"], 1);
+    ok(&mut a, "edit_redo", json!({ "doc": doc }));
+    ok(&mut a, "doc_save", json!({ "doc": doc, "path": "signed.pdf" }));
+    let reopened = ok(&mut a, "doc_open", json!({ "path": "signed.pdf" }))["doc"].as_u64().unwrap();
+    assert_eq!(ok(&mut a, "comment_list", json!({ "doc": reopened }))["count"], 2);
+    assert_eq!(render(&mut a, reopened), before, "saved appearances retain alpha and geometry");
+    for args in [
+        json!({ "type": "signature", "path": "broken.png" }),
+        json!({ "type": "signature", "path": "signature.png", "text": "Ada" }),
+        json!({ "type": "check", "path": "signature.png" }),
+        json!({ "type": "signature", "path": "../outside.png" }),
+    ] {
+        let mut args = args;
+        args["doc"] = json!(doc);
+        args["page"] = json!(1);
+        args["at"] = json!([20, 80]);
+        assert!(a.call("fill_sign_add", &args).is_err(), "{args}");
+    }
+    assert_eq!(ok(&mut a, "comment_list", json!({ "doc": doc }))["count"], 2, "errors leave the PDF intact");
+}
+
+#[test]
 fn creating_and_reducing_through_tools() {
     let dir = workdir("create");
     std::fs::write(dir.join("notes.txt"), "Meeting notes\nAction items").unwrap();

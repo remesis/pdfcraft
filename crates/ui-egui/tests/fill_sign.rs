@@ -193,7 +193,7 @@ fn changing_drawn_signatures_can_be_cancelled_or_switched_to_type() {
     assert!(h.state_mut().execute("sign.fill.signature.change"));
     h.run_steps(2);
     assert!(h.state().signature_draft.drawing);
-    assert_eq!(h.state().signature_draft.saved(), drawn);
+    assert_eq!(h.state().signature_draft.saved(), Some(drawn.clone()));
     h.get_by_label("Clear").click();
     h.run_steps(2);
     assert!(h.state().signature_draft.strokes.is_empty());
@@ -204,7 +204,7 @@ fn changing_drawn_signatures_can_be_cancelled_or_switched_to_type() {
 
     assert!(h.state_mut().execute("sign.fill.signature.change"));
     h.run_steps(2);
-    assert_eq!(h.state().signature_draft.saved(), drawn);
+    assert_eq!(h.state().signature_draft.saved(), Some(drawn.clone()));
     h.get_all_by_label("Type").last().unwrap().click();
     h.run_steps(2);
     h.state_mut().signature_draft.text = "Grace Hopper".into();
@@ -275,4 +275,128 @@ fn long_typed_names_fit_the_placed_signature_and_keep_every_outline() {
     let s = h.state();
     let a = &s.session.get(s.views[0].id).unwrap().info.annotations[0];
     assert!(a.rect[2] <= 190.001, "the full name fits on the page: {:?}", a.rect);
+}
+
+fn signature_file(test: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("pdfcraft-signature-{test}-{}.png", std::process::id()));
+    let image = image::RgbaImage::from_fn(120, 40, |x, y| {
+        if (10..110).contains(&x) && (15..25).contains(&y) { image::Rgba([20, 30, 40, 255]) } else { image::Rgba([0, 0, 0, 0]) }
+    });
+    image.save(&path).unwrap();
+    path
+}
+
+fn browse_image(h: &mut Harness<'static, PdfCraftApp>, path: &std::path::Path) {
+    h.state_mut().pick_override = Some(vec![path.to_string_lossy().into_owned()]);
+    h.get_by_label("Browse…").click();
+    h.run_steps(3);
+}
+
+#[test]
+fn image_signatures_and_initials_can_be_imported_placed_and_remembered() {
+    let path = signature_file("import");
+    let mut h = harness();
+    for (command, y, initials) in [("sign.fill.signature", 250.0, false), ("sign.fill.initials", 150.0, true)] {
+        h.state_mut().execute(command);
+        h.run_steps(2);
+        h.get_by_label("Image").click();
+        h.run_steps(2);
+        assert!(h.state().signature_draft.saved().is_none(), "Apply needs an image");
+        browse_image(&mut h, &path);
+        assert!(h.state().signature_draft.image.is_some());
+        if !initials && let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
+            h.render().unwrap().save(format!("{dir}/image-signature-dialog.png")).unwrap();
+        }
+        assert_eq!(items(&h).len(), usize::from(initials), "importing doesn't edit the PDF");
+        h.get_by_label("Apply").click();
+        h.run_steps(3);
+        click(&mut h, 40.0, y);
+    }
+    assert_eq!(items(&h).len(), 2);
+    let state = h.state();
+    let doc = state.session.get(state.views[0].id).unwrap();
+    for a in &doc.info.annotations {
+        assert_eq!(a.subtype, "Stamp");
+        assert!(((a.rect[2] - a.rect[0]) / (a.rect[3] - a.rect[1]) - 3.0).abs() < 0.001);
+        assert!(a.rect[2] - a.rect[0] <= 150.0);
+    }
+    assert_eq!(doc.can_undo(), Some("Add initials"));
+    let settings = state.persist();
+    assert!(!settings.contains(&path.to_string_lossy().to_string()), "only the image is saved, never its source path");
+    let mut again = PdfCraftApp::new();
+    again.restore(&settings);
+    assert_eq!(again.signature, state.signature);
+    assert_eq!(again.initials, state.initials);
+    let saved_image = state.signature.clone();
+    h.state_mut().execute("sign.fill.signature.change");
+    h.run_steps(2);
+    assert!(h.state().signature_draft.image_mode);
+    assert!(h.state().signature_draft.image.is_some());
+    h.get_by_label("Clear").click();
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert_eq!(h.state().signature, saved_image);
+    h.state_mut().execute("edit.undo");
+    h.run_steps(3);
+    assert_eq!(items(&h).len(), 1);
+    h.state_mut().execute("edit.redo");
+    h.run_steps(3);
+    assert_eq!(items(&h).len(), 2);
+    // Show the saved preview cards in the actual shell as well as the dialog.
+    h.state_mut().set_option("tool", "fill_sign").unwrap();
+    h.run_steps(3);
+    h.get_by_label("Use signature");
+    h.get_by_label("Use initials");
+    if let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
+        h.render().unwrap().save(format!("{dir}/image-signatures.png")).unwrap();
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn image_import_cancel_clear_and_errors_preserve_saved_signatures() {
+    let path = signature_file("cancel");
+    let mut h = harness();
+    let original = SavedSig::Typed("Ada Lovelace".into());
+    h.state_mut().signature = Some(original.clone());
+    h.state_mut().execute("sign.fill.signature.change");
+    h.run_steps(2);
+    h.get_by_label("Image").click();
+    h.run_steps(2);
+    h.state_mut().pick_override = Some(Vec::new());
+    h.get_by_label("Browse…").click();
+    h.run_steps(3);
+    assert!(h.state().signature_draft.image.is_none());
+    browse_image(&mut h, &path);
+    let loaded = h.state().signature_draft.image.clone();
+    std::fs::write(&path, b"broken PNG").unwrap();
+    browse_image(&mut h, &path);
+    assert_eq!(h.state().signature_draft.image, loaded, "an invalid replacement keeps the previous draft");
+    assert!(h.state().toast.as_ref().unwrap().0.contains("Couldn't import"));
+    h.get_by_label("Clear").click();
+    h.run_steps(2);
+    assert!(h.state().signature_draft.saved().is_none());
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert_eq!(h.state().signature, Some(original));
+    assert!(items(&h).is_empty());
+    // A picker answer from a closed dialog cannot populate a later draft.
+    h.state_mut().execute("sign.fill.signature.change");
+    h.run_steps(2);
+    h.get_by_label("Image").click();
+    h.run_steps(2);
+    assert_eq!(signature_file("cancel"), path, "replace the corrupt file with a valid image for the stale-answer check");
+    h.state_mut().pick_override = Some(vec![path.to_string_lossy().into_owned()]);
+    h.get_by_label("Browse…").click();
+    h.run_steps(1);
+    h.state_mut().dialog = None;
+    h.run_steps(3);
+    assert!(h.state().signature_draft.image.is_none());
+    // Malformed settings are ignored while legacy typed/drawn values still restore.
+    let mut again = PdfCraftApp::new();
+    again.restore(r#"{"signature_text":"Ada","signature_image":{"Image":"bm90IGFuIGltYWdl"},"initials":{"Image":"%%%"}}"#);
+    assert_eq!(again.signature, Some(SavedSig::Typed("Ada".into())));
+    assert!(again.initials.is_none());
+    std::fs::remove_file(path).unwrap();
 }

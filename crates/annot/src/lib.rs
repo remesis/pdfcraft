@@ -724,12 +724,19 @@ fn rect_for(shape: &Shape, style: &Style) -> Result<[f64; 4], AnnotError> {
         | Shape::TextBox { rect, .. }
         | Shape::Typewriter { rect, .. }
         | Shape::Stamp { rect, .. }
-        | Shape::CustomStamp { rect, .. }
         | Shape::TypedSignature { rect, .. }
         | Shape::Mark { rect, .. } => {
             let r = normalize(*rect);
             if !finite(rect) || r[2] - r[0] < 1.0 || r[3] - r[1] < 1.0 {
                 return Err(bad("rectangle (too small)"));
+            }
+            r
+        }
+        Shape::CustomStamp { rect, .. } => {
+            let r = normalize(*rect);
+            // Image signatures may be very thin; a positive PDF appearance box still works.
+            if !finite(rect) || r[2] <= r[0] || r[3] <= r[1] {
+                return Err(bad("rectangle (empty)"));
             }
             r
         }
